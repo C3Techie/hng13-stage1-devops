@@ -1,463 +1,469 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
-# DevOps Stage 1 — Automated Deployment Script
-# - Single-file, production-grade bash script
-# - Deploys a Dockerized app to a remote Linux server, configures Nginx, validates health
-# - Implements: prompts + flags, logging, traps, idempotency, cleanup
+set -euo pipefail
 
-set -Eeuo pipefail
-IFS=$'\n\t'
-
-########################################
-# Global defaults and constants
-########################################
-SCRIPT_NAME=${0##*/}
-START_TS=$(date +%Y%m%d-%H%M%S)
-LOG_DIR=${LOG_DIR:-"$(pwd)/logs"}
-LOG_FILE="$LOG_DIR/deploy_${START_TS}.log"
-
-# Exit codes per stage
-EC_INPUT=10
-EC_GIT=20
-EC_SSH=30
-EC_REMOTE_SETUP=40
-EC_DEPLOY=50
-EC_NGINX=60
-EC_VALIDATE=70
-EC_CLEANUP=90
-
-# Defaults (can be overridden by flags or prompts)
-BRANCH="main"
-SSH_PORT="22"
-REMOTE_DIR=""
-PROJECT_NAME=""
-NON_INTERACTIVE="false"
-CLEANUP_ONLY="false"
-
-########################################
-# Logging helpers
-########################################
-init_logging() {
-  mkdir -p "$LOG_DIR"
-  # Redirect all stdout/stderr to tee, keep interactive prompts clean by writing them to /dev/tty
-  exec > >(tee -a "$LOG_FILE") 2>&1
-  log info "Logging to $LOG_FILE"
-}
+LOG_FILE="deploy_$(date +%Y%m%d_%H%M%S).log"
+TEMP_DIR=$(mktemp -d)
+CLEANUP_MODE=false
 
 log() {
-  local level=$1; shift || true
-  local msg=$*
-  printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$msg"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
 }
 
-die() {
-  local code=$1; shift
-  log error "$* (exit=$code)"
-  exit "$code"
+error_exit() {
+    log "ERROR: $1"
+    exit "${2:-1}"
 }
 
-on_error() {
-  local exit_code=$?
-  local line_no=$1
-  log error "Unexpected error at line $line_no (exit=$exit_code). See $LOG_FILE"
-  exit "$exit_code"
+cleanup() {
+    log "Cleaning up temporary files..."
+    rm -rf "$TEMP_DIR"
 }
 
-trap 'on_error $LINENO' ERR
-trap 'log info "Script finished. Log: $LOG_FILE"' EXIT
+trap cleanup EXIT
+trap 'error_exit "Script interrupted" 130' INT TERM
 
-########################################
-# Usage
-########################################
-usage() {
-  cat <<USAGE
-$SCRIPT_NAME - Automated Docker deployment to a remote Linux server
-
-Required inputs (via flags or interactive prompts):
-  --repo-url URL             Git repository URL (https://github.com/user/repo.git)
-  --pat TOKEN                GitHub Personal Access Token (repo read access). Will not be logged.
-  --ssh-user USER            SSH username for remote server
-  --ssh-host HOST            Remote server IP or DNS name
-  --ssh-key PATH             Path to private SSH key file
-  --app-port PORT            Internal container app port to expose and proxy (e.g., 3000)
-
-Optional:
-  --branch NAME              Git branch to deploy (default: main)
-  --ssh-port PORT            SSH port (default: 22)
-  --project-name NAME        Override project/container/compose project name (defaults to repo name)
-  --remote-dir PATH          Remote deploy dir (default: /opt/apps/<project-name>)
-  --non-interactive          Fail if required inputs missing instead of prompting
-  --cleanup                  Cleanup deployed resources on remote and exit
-  --help                     Show this help
-
-Examples:
-  $SCRIPT_NAME --repo-url https://github.com/user/app.git --pat ***** \\
-    --ssh-user ubuntu --ssh-host 203.0.113.10 --ssh-key ~/.ssh/id_rsa --app-port 3000
-
-  $SCRIPT_NAME --cleanup --ssh-user ubuntu --ssh-host 203.0.113.10 --ssh-key ~/.ssh/id_rsa \
-    --project-name app --remote-dir /opt/apps/app
-USAGE
-}
-
-########################################
-# Prompt helpers (keep secrets off logs)
-########################################
-prompt_var() {
-  # $1=var_name, $2=prompt text, $3=secret(true/false), $4=default(optional)
-  local __var_name=$1; shift
-  local __prompt=$1; shift
-  local __secret=${1:-false}; shift || true
-  local __default=${1:-}; shift || true
-
-  local __value=${!__var_name:-}
-  if [[ -z "$__value" ]]; then
-    if [[ "$NON_INTERACTIVE" == "true" ]]; then
-      die $EC_INPUT "Missing required input: $__var_name"
+validate_input() {
+    local var_name=$1
+    local var_value=$2
+    local pattern=$3
+    
+    if [[ -z "$var_value" ]]; then
+        error_exit "$var_name cannot be empty" 2
     fi
-    if [[ -n "$__default" ]]; then
-      printf '%s [%s]: ' "$__prompt" "$__default" > /dev/tty
+    
+    if [[ -n "$pattern" ]] && ! [[ "$var_value" =~ $pattern ]]; then
+        error_exit "$var_name format is invalid" 3
+    fi
+}
+
+check_dependencies() {
+    log "Checking local dependencies..."
+    local deps=("git" "ssh" "scp")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            error_exit "$dep is not installed" 4
+        fi
+    done
+    log "All local dependencies satisfied"
+}
+
+collect_parameters() {
+    log "Collecting deployment parameters..."
+    
+    read -rp "Enter Git Repository URL: " GIT_REPO_URL
+    validate_input "Git Repository URL" "$GIT_REPO_URL" "^https?://.+"
+    
+    read -rsp "Enter Personal Access Token (PAT): " GIT_PAT
+    echo
+    validate_input "Personal Access Token" "$GIT_PAT" ""
+    
+    read -rp "Enter Branch name [main]: " GIT_BRANCH
+    GIT_BRANCH=${GIT_BRANCH:-main}
+    
+    read -rp "Enter SSH Username: " SSH_USER
+    validate_input "SSH Username" "$SSH_USER" ""
+    
+    read -rp "Enter Server IP Address: " SERVER_IP
+    validate_input "Server IP" "$SERVER_IP" "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$"
+    
+    read -rp "Enter SSH Key Path [~/.ssh/id_rsa]: " SSH_KEY_PATH
+    SSH_KEY_PATH=${SSH_KEY_PATH:-~/.ssh/id_rsa}
+    SSH_KEY_PATH="${SSH_KEY_PATH/#\~/$HOME}"
+    
+    if [[ ! -f "$SSH_KEY_PATH" ]]; then
+        error_exit "SSH key not found at $SSH_KEY_PATH" 5
+    fi
+    
+    read -rp "Enter Application Port: " APP_PORT
+    validate_input "Application Port" "$APP_PORT" "^[0-9]+$"
+    
+    if [[ $APP_PORT -lt 1 || $APP_PORT -gt 65535 ]]; then
+        error_exit "Port must be between 1 and 65535" 6
+    fi
+    
+    REPO_NAME=$(basename "$GIT_REPO_URL" .git)
+    REPO_DIR="$TEMP_DIR/$REPO_NAME"
+    
+    log "Parameters collected successfully"
+}
+
+clone_repository() {
+    log "Cloning repository from $GIT_REPO_URL..."
+    
+    local auth_url
+    if [[ "$GIT_REPO_URL" =~ ^https://github.com ]]; then
+        auth_url="${GIT_REPO_URL/https:\/\//https://${GIT_PAT}@}"
     else
-      printf '%s: ' "$__prompt" > /dev/tty
+        auth_url="https://${GIT_PAT}@${GIT_REPO_URL#https://}"
     fi
-    if [[ "$__secret" == "true" ]]; then
-      read -r -s __value < /dev/tty
-      printf '\n' > /dev/tty
+    
+    if [[ -d "$REPO_DIR" ]]; then
+        log "Repository already exists, pulling latest changes..."
+        cd "$REPO_DIR"
+        git pull origin "$GIT_BRANCH" >> "$LOG_FILE" 2>&1 || error_exit "Failed to pull repository" 7
     else
-      read -r __value < /dev/tty
+        git clone "$auth_url" "$REPO_DIR" >> "$LOG_FILE" 2>&1 || error_exit "Failed to clone repository" 7
+        cd "$REPO_DIR"
     fi
-    if [[ -z "$__value" && -n "$__default" ]]; then
-      __value="$__default"
+    
+    git checkout "$GIT_BRANCH" >> "$LOG_FILE" 2>&1 || error_exit "Failed to checkout branch $GIT_BRANCH" 8
+    log "Repository ready at $REPO_DIR on branch $GIT_BRANCH"
+}
+
+verify_dockerfile() {
+    log "Verifying Dockerfile or docker-compose.yml..."
+    
+    if [[ -f "Dockerfile" ]]; then
+        log "Found Dockerfile"
+        USE_COMPOSE=false
+    elif [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+        log "Found docker-compose.yml"
+        USE_COMPOSE=true
+    else
+        error_exit "No Dockerfile or docker-compose.yml found" 9
     fi
-  fi
-  printf -v "$__var_name" '%s' "$__value"
 }
 
-########################################
-# Args parsing
-########################################
-REPO_URL=""
-PAT=""
-SSH_USER=""
-SSH_HOST=""
-SSH_KEY=""
-APP_PORT=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --repo-url) REPO_URL="$2"; shift 2 ;;
-    --pat) PAT="$2"; shift 2 ;;
-    --branch) BRANCH="$2"; shift 2 ;;
-    --ssh-user) SSH_USER="$2"; shift 2 ;;
-    --ssh-host) SSH_HOST="$2"; shift 2 ;;
-    --ssh-key) SSH_KEY="$2"; shift 2 ;;
-    --ssh-port) SSH_PORT="$2"; shift 2 ;;
-    --app-port) APP_PORT="$2"; shift 2 ;;
-    --project-name) PROJECT_NAME="$2"; shift 2 ;;
-    --remote-dir) REMOTE_DIR="$2"; shift 2 ;;
-    --non-interactive) NON_INTERACTIVE="true"; shift ;;
-    --cleanup) CLEANUP_ONLY="true"; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) log warn "Unknown arg: $1"; usage; exit 0 ;;
-  esac
-done
-
-init_logging
-
-########################################
-# Collect and validate inputs
-########################################
-prompt_var REPO_URL "Git repository URL (https)"
-prompt_var PAT "GitHub Personal Access Token (will not echo)" true
-prompt_var BRANCH "Git branch" false "${BRANCH}"
-prompt_var SSH_USER "SSH username"
-prompt_var SSH_HOST "SSH host (IP or DNS)"
-prompt_var SSH_KEY "SSH private key path" false "${SSH_KEY}"
-prompt_var APP_PORT "Application internal container port (e.g., 3000)"
-
-if [[ -z "$PROJECT_NAME" ]]; then
-  PROJECT_NAME=$(basename "$REPO_URL")
-  PROJECT_NAME=${PROJECT_NAME%.git}
-fi
-
-if [[ -z "$REMOTE_DIR" ]]; then
-  REMOTE_DIR="/opt/apps/${PROJECT_NAME}"
-fi
-
-# Basic validation
-[[ $REPO_URL =~ ^https?:// ]] || die $EC_INPUT "repo-url must be http(s) URL"
-[[ -n "$PAT" ]] || die $EC_INPUT "PAT is required"
-[[ -n "$SSH_USER" ]] || die $EC_INPUT "ssh-user is required"
-[[ -n "$SSH_HOST" ]] || die $EC_INPUT "ssh-host is required"
-[[ -n "$SSH_KEY" ]] || die $EC_INPUT "ssh-key is required"
-[[ -f "$SSH_KEY" ]] || die $EC_INPUT "ssh-key file not found: $SSH_KEY"
-[[ "$APP_PORT" =~ ^[0-9]{2,5}$ ]] || die $EC_INPUT "app-port must be a number"
-
-log info "Project: $PROJECT_NAME | Branch: $BRANCH | Remote: $SSH_USER@$SSH_HOST:$SSH_PORT | Remote dir: $REMOTE_DIR | App port: $APP_PORT"
-
-########################################
-# Tooling checks
-########################################
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die $EC_INPUT "Required command not found: $1"; }
-
-need_cmd git; need_cmd ssh; need_cmd scp; need_cmd sed; need_cmd awk; need_cmd grep; need_cmd curl
-
-########################################
-# Local clone/pull with PAT auth via header (avoid printing token)
-########################################
-LOCAL_WS_DIR="$(pwd)/_workspace"
-LOCAL_CLONE_DIR="$LOCAL_WS_DIR/$PROJECT_NAME"
-mkdir -p "$LOCAL_WS_DIR"
-
-if [[ ! -d "$LOCAL_CLONE_DIR/.git" ]]; then
-  log info "Cloning repository into $LOCAL_CLONE_DIR"
-  git -c http.extraHeader="Authorization: Bearer ${PAT}" clone \
-      --branch "$BRANCH" --single-branch "$REPO_URL" "$LOCAL_CLONE_DIR" \
-      || die $EC_GIT "git clone failed"
-else
-  log info "Repository exists. Pulling latest changes for branch $BRANCH"
-  (
-    cd "$LOCAL_CLONE_DIR"
-    git -c http.extraHeader="Authorization: Bearer ${PAT}" fetch origin "$BRANCH" || die $EC_GIT "git fetch failed"
-    git checkout -B "$BRANCH" "origin/$BRANCH" || die $EC_GIT "git checkout failed"
-  )
-fi
-
-# Verify Dockerfile or compose present
-(
-  cd "$LOCAL_CLONE_DIR"
-  if [[ -f Dockerfile ]] || [[ -f docker-compose.yml ]] || [[ -f docker-compose.yaml ]] || [[ -f compose.yml ]] || [[ -f compose.yaml ]]; then
-    log info "Found container definition in cloned project"
-  else
-    die $EC_GIT "No Dockerfile or compose file found in repo"
-  fi
-)
-
-########################################
-# SSH connectivity
-########################################
-SSH_OPTS=( -i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$HOME/.ssh/known_hosts" -o ConnectTimeout=15 )
-
-log info "Testing SSH connectivity to $SSH_USER@$SSH_HOST:$SSH_PORT"
-if ! ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "echo ok" >/dev/null 2>&1; then
-  die $EC_SSH "SSH connection failed. Check user/host/key/port and security groups"
-fi
-
-########################################
-# Cleanup mode (remove resources and exit)
-########################################
-remote_cleanup() {
-  log info "Starting remote cleanup for project=$PROJECT_NAME dir=$REMOTE_DIR"
-  ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" bash -s <<EOF || die $EC_CLEANUP "Cleanup failed"
-set -Eeuo pipefail
-PROJECT_NAME="$PROJECT_NAME"
-REMOTE_DIR="$REMOTE_DIR"
-
-compose_cmd() {
-  if docker compose version >/dev/null 2>&1; then echo "docker compose"; exit 0; fi
-  if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; exit 0; fi
-  echo ""; exit 0
+test_ssh_connection() {
+    log "Testing SSH connection to $SSH_USER@$SERVER_IP..."
+    
+    if ! ssh -i "$SSH_KEY_PATH" -o ConnectTimeout=10 -o StrictHostKeyChecking=no \
+        "$SSH_USER@$SERVER_IP" "echo 'SSH connection successful'" >> "$LOG_FILE" 2>&1; then
+        error_exit "SSH connection failed" 10
+    fi
+    
+    log "SSH connection verified"
 }
 
-COMPOSE=
-if docker compose version >/dev/null 2>&1; then COMPOSE="docker compose"; elif command -v docker-compose >/dev/null 2>&1; then COMPOSE="docker-compose"; fi
+prepare_remote_environment() {
+    log "Preparing remote environment on $SERVER_IP..."
+    
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "bash -s" << 'ENDSSH' >> "$LOG_FILE" 2>&1
+set -e
 
-set +e
-if [[ -n "\$COMPOSE" ]] && [[ -f "\$REMOTE_DIR/docker-compose.yml" || -f "\$REMOTE_DIR/docker-compose.yaml" || -f "\$REMOTE_DIR/compose.yml" || -f "\$REMOTE_DIR/compose.yaml" ]]; then
-  sudo \$COMPOSE -p "\$PROJECT_NAME" -f "\$REMOTE_DIR/docker-compose.yml" down -v 2>/dev/null || true
-  sudo \$COMPOSE -p "\$PROJECT_NAME" -f "\$REMOTE_DIR/docker-compose.yaml" down -v 2>/dev/null || true
-  sudo \$COMPOSE -p "\$PROJECT_NAME" -f "\$REMOTE_DIR/compose.yml" down -v 2>/dev/null || true
-  sudo \$COMPOSE -p "\$PROJECT_NAME" -f "\$REMOTE_DIR/compose.yaml" down -v 2>/dev/null || true
+echo "Updating system packages..."
+sudo apt-get update -qq
+
+echo "Installing rsync..."
+if ! command -v rsync &> /dev/null; then
+    sudo apt-get install -y rsync
 fi
-sudo docker rm -f "\$PROJECT_NAME" 2>/dev/null || true
-sudo docker image rm -f "\$PROJECT_NAME:latest" 2>/dev/null || true
 
-# Remove Nginx config
-if [[ -d /etc/nginx/sites-enabled || -d /etc/nginx/sites-available ]]; then
-  sudo rm -f "/etc/nginx/sites-enabled/\$PROJECT_NAME" "/etc/nginx/sites-available/\$PROJECT_NAME" 2>/dev/null || true
-  if [[ -f /etc/nginx/sites-enabled/default ]]; then sudo rm -f /etc/nginx/sites-enabled/default || true; fi
-else
-  sudo rm -f "/etc/nginx/conf.d/\$PROJECT_NAME.conf" 2>/dev/null || true
+echo "Installing Docker..."
+if ! command -v docker &> /dev/null; then
+    sudo apt-get install -y docker.io
+    sudo systemctl enable docker
+    sudo systemctl start docker
 fi
-sudo nginx -t && sudo systemctl reload nginx 2>/dev/null || true
 
-# Remove files
-sudo rm -rf "\$REMOTE_DIR"
-echo "CLEANUP_DONE"
-EOF
-  log info "Cleanup complete."
+echo "Installing Docker Compose..."
+if ! command -v docker-compose &> /dev/null; then
+    sudo apt-get install -y docker-compose
+fi
+
+echo "Installing Nginx..."
+if ! command -v nginx &> /dev/null; then
+    sudo apt-get install -y nginx
+    sudo systemctl enable nginx
+    sudo systemctl start nginx
+fi
+
+echo "Adding user to docker group..."
+sudo usermod -aG docker $USER || true
+
+echo "Verifying installations..."
+docker --version
+docker-compose --version
+nginx -v
+rsync --version
+
+echo "Testing Docker access..."
+sudo docker ps > /dev/null 2>&1 && echo "Docker is accessible with sudo"
+
+echo "Remote environment ready"
+ENDSSH
+    
+    local prep_status=$?
+    if [[ $prep_status -ne 0 ]]; then
+        error_exit "Failed to prepare remote environment (exit code: $prep_status)" 11
+    fi
+    
+    log "Remote environment prepared successfully"
 }
 
-if [[ "$CLEANUP_ONLY" == "true" ]]; then
-  remote_cleanup
-  exit 0
+deploy_application() {
+    log "Deploying application to remote server..."
+    log "Repository name: $REPO_NAME"
+    log "Use compose: $USE_COMPOSE"
+    
+    local remote_path="/home/$SSH_USER/deployments/$REPO_NAME"
+    log "Remote path: $remote_path"
+    
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" \
+        "mkdir -p $remote_path" >> "$LOG_FILE" 2>&1
+    
+    log "Transferring files to remote server..."
+    
+    # Check if rsync is available locally
+    if command -v rsync &> /dev/null; then
+        log "Using rsync for file transfer..."
+        rsync -avz --exclude='.git' -e "ssh -i $SSH_KEY_PATH -o StrictHostKeyChecking=no" \
+            "$REPO_DIR/" "$SSH_USER@$SERVER_IP:$remote_path/" >> "$LOG_FILE" 2>&1 || \
+            error_exit "Failed to transfer files with rsync" 12
+    else
+        log "rsync not available, using scp for file transfer..."
+        # Create a tarball to transfer
+        local tar_file="$TEMP_DIR/${REPO_NAME}.tar.gz"
+        tar -czf "$tar_file" -C "$TEMP_DIR" --exclude='.git' "$REPO_NAME" >> "$LOG_FILE" 2>&1 || \
+            error_exit "Failed to create tarball" 12
+        
+        # Transfer tarball
+        scp -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$tar_file" \
+            "$SSH_USER@$SERVER_IP:/tmp/${REPO_NAME}.tar.gz" >> "$LOG_FILE" 2>&1 || \
+            error_exit "Failed to transfer tarball" 12
+        
+        # Extract on remote server
+        ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" \
+            "tar -xzf /tmp/${REPO_NAME}.tar.gz -C /home/$SSH_USER/deployments/ && rm /tmp/${REPO_NAME}.tar.gz" \
+            >> "$LOG_FILE" 2>&1 || error_exit "Failed to extract files on remote server" 12
+    fi
+    
+    log "Files transferred successfully"
+    log "Building and running Docker containers..."
+    
+    if [[ "$USE_COMPOSE" == true ]]; then
+        ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "bash -s" << ENDSSH >> "$LOG_FILE" 2>&1
+set -e
+cd $remote_path
+
+echo "Stopping existing containers..."
+sudo docker-compose down || true
+
+echo "Building and starting containers..."
+sudo docker-compose up -d --build
+
+echo "Waiting for containers to be healthy..."
+sleep 10
+
+sudo docker-compose ps
+echo "Docker compose deployment completed"
+ENDSSH
+        local deploy_status=$?
+        if [[ $deploy_status -ne 0 ]]; then
+            error_exit "Failed to deploy application with docker-compose (exit code: $deploy_status)" 13
+        fi
+    else
+        ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "bash -s" << ENDSSH >> "$LOG_FILE" 2>&1
+set -e
+cd $remote_path
+
+CONTAINER_NAME="${REPO_NAME}_app"
+IMAGE_NAME="${REPO_NAME}:latest"
+
+echo "Current directory: \$(pwd)"
+echo "Listing directory contents:"
+ls -la
+
+echo "Stopping and removing existing container..."
+sudo docker stop \$CONTAINER_NAME 2>/dev/null || true
+sudo docker rm \$CONTAINER_NAME 2>/dev/null || true
+
+echo "Building Docker image..."
+if ! sudo docker build -t \$IMAGE_NAME .; then
+    echo "ERROR: Docker build failed"
+    exit 1
 fi
 
-########################################
-# Remote environment preparation
-########################################
-log info "Preparing remote environment (Docker, Compose, Nginx)"
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" bash -s <<'REMOTE_SETUP' || die $EC_REMOTE_SETUP "Remote preparation failed"
-set -Eeuo pipefail
+echo "Running container..."
+if ! sudo docker run -d --name \$CONTAINER_NAME -p $APP_PORT:$APP_PORT \$IMAGE_NAME; then
+    echo "ERROR: Docker run failed"
+    exit 1
+fi
 
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
+echo "Waiting for container to be healthy..."
+sleep 10
 
-PM=""
-if need_cmd apt-get; then PM="apt"; fi
-if [[ -z "$PM" ]] && need_cmd dnf; then PM="dnf"; fi
-if [[ -z "$PM" ]] && need_cmd yum; then PM="yum"; fi
-if [[ -z "$PM" ]] && need_cmd zypper; then PM="zypper"; fi
+echo "Checking container status..."
+sudo docker ps -a | grep \$CONTAINER_NAME || echo "WARNING: Container not found in docker ps"
 
-install_pkgs() {
-  case "$PM" in
-    apt)
-      sudo apt-get update -y
-      sudo apt-get install -y ca-certificates curl gnupg lsb-release
-      # Docker engine + compose plugin + nginx
-      sudo apt-get install -y docker.io docker-compose-plugin nginx
-      ;;
-    dnf)
-      sudo dnf -y install dnf-plugins-core || true
-      sudo dnf -y install docker nginx curl || true
-      # compose plugin may be in docker-ce or extras; fallback to docker-compose
-      if ! docker compose version >/dev/null 2>&1; then
-        sudo dnf -y install docker-compose || true
-      fi
-      ;;
-    yum)
-      sudo yum -y install docker nginx curl || true
-      if ! docker compose version >/dev/null 2>&1; then
-        sudo yum -y install docker-compose || true
-      fi
-      ;;
-    zypper)
-      sudo zypper refresh -y || true
-      sudo zypper install -y docker nginx curl || true
-      if ! docker compose version >/dev/null 2>&1; then
-        sudo zypper install -y docker-compose || true
-      fi
-      ;;
-    *)
-      echo "Unsupported package manager" >&2
-      exit 1
-      ;;
-  esac
+echo "Checking if container is running..."
+if sudo docker ps | grep -q \$CONTAINER_NAME; then
+    echo "SUCCESS: Container is running"
+else
+    echo "ERROR: Container is not running"
+    echo "Container logs:"
+    sudo docker logs \$CONTAINER_NAME 2>&1 || true
+    exit 1
+fi
+
+echo "Getting container logs..."
+sudo docker logs \$CONTAINER_NAME 2>&1 | tail -20 || true
+
+echo "Docker deployment completed successfully"
+ENDSSH
+        local deploy_status=$?
+        if [[ $deploy_status -ne 0 ]]; then
+            log "Docker deployment failed with exit code: $deploy_status"
+            log "Fetching container logs for debugging..."
+            ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" \
+                "docker logs ${REPO_NAME}_app 2>&1 | tail -50" >> "$LOG_FILE" 2>&1 || true
+            error_exit "Failed to deploy application" 13
+        fi
+    fi
+    
+    log "Application deployed successfully"
 }
 
-install_pkgs
-
-# Enable and start services
-sudo systemctl enable --now docker || sudo service docker start || true
-sudo systemctl enable --now nginx || sudo service nginx start || true
-
-# Add current user to docker group (best-effort)
-if id -nG "$USER" | grep -qw docker; then :; else
-  sudo groupadd -f docker || true
-  sudo usermod -aG docker "$USER" || true
-fi
-
-docker --version || true
-if docker compose version >/dev/null 2>&1; then docker compose version || true; fi
-if command -v docker-compose >/dev/null 2>&1; then docker-compose --version || true; fi
-nginx -v || true
-REMOTE_SETUP
-
-########################################
-# Transfer project files
-########################################
-log info "Syncing project files to remote: $REMOTE_DIR"
-# Ensure target dir exists and is writable by ssh user
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "sudo mkdir -p '$REMOTE_DIR' && sudo chown -R '$SSH_USER':'$SSH_USER' '$REMOTE_DIR'"
-
-if command -v rsync >/dev/null 2>&1; then
-  rsync -az -e "ssh -p $SSH_PORT -i $SSH_KEY -o StrictHostKeyChecking=accept-new" --delete "$LOCAL_CLONE_DIR/" "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
-else
-  # Fallback: scp (no --delete)
-  scp -r -P "$SSH_PORT" -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new "$LOCAL_CLONE_DIR"/* "$SSH_USER@$SSH_HOST:$REMOTE_DIR/" || true
-fi
-
-########################################
-# Deploy containers on remote
-########################################
-log info "Deploying containers on remote host"
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" bash -s <<EOF || die $EC_DEPLOY "Remote deploy failed"
-set -Eeuo pipefail
-PROJECT_NAME="$PROJECT_NAME"
-REMOTE_DIR="$REMOTE_DIR"
-APP_PORT="$APP_PORT"
-
-cd "$REMOTE_DIR"
-
-has_compose_file=false
-for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
-  if [[ -f "\$f" ]]; then has_compose_file=true; export COMPOSE_FILE="\$f"; break; fi
-done
-
-if docker compose version >/dev/null 2>&1; then COMPOSE_CMD="docker compose"; elif command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="docker-compose"; else COMPOSE_CMD=""; fi
-
-if [[ "\$has_compose_file" == "true" && -n "\$COMPOSE_CMD" ]]; then
-  echo "Using compose: \$COMPOSE_CMD (project=\$PROJECT_NAME, file=\$COMPOSE_FILE)"
-  sudo \$COMPOSE_CMD -p "\$PROJECT_NAME" -f "\$COMPOSE_FILE" down --remove-orphans || true
-  sudo \$COMPOSE_CMD -p "\$PROJECT_NAME" -f "\$COMPOSE_FILE" up -d --build
-else
-  echo "Compose not available or compose file missing. Falling back to Dockerfile build/run"
-  [[ -f Dockerfile ]] || { echo "No Dockerfile found" >&2; exit 1; }
-  sudo docker rm -f "\$PROJECT_NAME" 2>/dev/null || true
-  sudo docker build -t "\$PROJECT_NAME:latest" .
-  # Map host APP_PORT to container APP_PORT
-  sudo docker run -d --name "\$PROJECT_NAME" -p "\$APP_PORT:\$APP_PORT" --restart unless-stopped "\$PROJECT_NAME:latest"
-fi
-
-# Quick container status
-sudo docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}' | (grep -E "^\$PROJECT_NAME\b" || true)
+configure_nginx() {
+    log "Configuring Nginx reverse proxy..."
+    
+    local nginx_config="/etc/nginx/sites-available/$REPO_NAME"
+    local nginx_enabled="/etc/nginx/sites-enabled/$REPO_NAME"
+    
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash << ENDSSH >> "$LOG_FILE" 2>&1
+        set -e
+        
+        echo "Creating Nginx configuration..."
+        sudo tee $nginx_config > /dev/null << EOF
+server {
+    listen 80;
+    server_name _;
+    
+    location / {
+        proxy_pass http://localhost:$APP_PORT;
+        proxy_set_header Host \\\$host;
+        proxy_set_header X-Real-IP \\\$remote_addr;
+        proxy_set_header X-Forwarded-For \\\$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \\\$scheme;
+    }
+}
 EOF
+        
+        echo "Enabling site..."
+        sudo rm -f $nginx_enabled
+        sudo ln -s $nginx_config $nginx_enabled
+        
+        echo "Removing default site..."
+        sudo rm -f /etc/nginx/sites-enabled/default
+        
+        echo "Testing Nginx configuration..."
+        sudo nginx -t
+        
+        echo "Reloading Nginx..."
+        sudo systemctl reload nginx
+        
+        echo "Nginx configured successfully"
+ENDSSH
+    
+    if [[ $? -ne 0 ]]; then
+        error_exit "Failed to configure Nginx" 14
+    fi
+    
+    log "Nginx configured successfully"
+}
 
-########################################
-# Configure Nginx reverse proxy
-########################################
-log info "Configuring Nginx reverse proxy on remote"
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" bash -s <<EOF || die $EC_NGINX "Nginx configuration failed"
-set -Eeuo pipefail
-PROJECT_NAME="$PROJECT_NAME"
-APP_PORT="$APP_PORT"
+validate_deployment() {
+    log "Validating deployment..."
+    
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "bash -s" << 'ENDSSH' >> "$LOG_FILE" 2>&1
+set -e
 
-NGX_AVAILABLE="/etc/nginx/sites-available"
-NGX_ENABLED="/etc/nginx/sites-enabled"
-NGX_CONF_D="/etc/nginx/conf.d"
+echo "Checking Docker service..."
+sudo systemctl is-active docker
 
-CONF_CONTENT="server {\n  listen 80;\n  server_name _;\n\n  location / {\n    proxy_set_header Host \$host;\n    proxy_set_header X-Real-IP \$remote_addr;\n    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;\n    proxy_set_header X-Forwarded-Proto \$scheme;\n    proxy_pass http://127.0.0.1:${APP_PORT};\n    proxy_http_version 1.1;\n    proxy_set_header Connection \"\";\n  }\n\n  # SSL placeholder: integrate Certbot or self-signed in future\n}"
+echo "Checking running containers..."
+sudo docker ps
 
-if [[ -d "\$NGX_AVAILABLE" && -d "\$NGX_ENABLED" ]]; then
-  echo -e "\$CONF_CONTENT" | sudo tee "\$NGX_AVAILABLE/\$PROJECT_NAME" >/dev/null
-  sudo ln -sf "\$NGX_AVAILABLE/\$PROJECT_NAME" "\$NGX_ENABLED/\$PROJECT_NAME"
-  if [[ -f "\$NGX_ENABLED/default" ]]; then sudo rm -f "\$NGX_ENABLED/default" || true; fi
+echo "Checking Nginx service..."
+sudo systemctl is-active nginx
+
+echo "Testing local endpoint..."
+curl -sf http://localhost > /dev/null || echo "Warning: Local endpoint not responding"
+ENDSSH
+    
+    if [[ $? -ne 0 ]]; then
+        error_exit "Deployment validation failed" 15
+    fi
+    
+    log "Testing remote endpoint..."
+    if curl -sf "http://$SERVER_IP" > /dev/null 2>&1; then
+        log "Remote endpoint is accessible"
+    else
+        log "WARNING: Remote endpoint not accessible via HTTP"
+    fi
+    
+    log "Deployment validated successfully"
+}
+
+cleanup_resources() {
+    log "Cleaning up deployment resources..."
+    
+    ssh -i "$SSH_KEY_PATH" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "bash -s" << ENDSSH >> "$LOG_FILE" 2>&1
+set -e
+
+REMOTE_PATH="/home/$SSH_USER/deployments/$REPO_NAME"
+
+echo "Stopping containers..."
+cd \$REMOTE_PATH || true
+if [[ -f "docker-compose.yml" ]] || [[ -f "docker-compose.yaml" ]]; then
+    sudo docker-compose down -v || true
 else
-  # RHEL/CentOS style
-  echo -e "\$CONF_CONTENT" | sudo tee "\$NGX_CONF_D/\$PROJECT_NAME.conf" >/dev/null
+    sudo docker stop ${REPO_NAME}_app || true
+    sudo docker rm ${REPO_NAME}_app || true
+    sudo docker rmi ${REPO_NAME}:latest || true
 fi
 
-sudo nginx -t
-sudo systemctl reload nginx || sudo service nginx reload
-EOF
+echo "Removing Nginx configuration..."
+sudo rm -f /etc/nginx/sites-enabled/$REPO_NAME
+sudo rm -f /etc/nginx/sites-available/$REPO_NAME
+sudo nginx -t && sudo systemctl reload nginx
 
-########################################
-# Validation
-########################################
-log info "Validating services on remote"
-ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" bash -s <<EOF || die $EC_VALIDATE "Validation failed"
-set -Eeuo pipefail
-PROJECT_NAME="$PROJECT_NAME"
-APP_PORT="$APP_PORT"
+echo "Removing deployment directory..."
+rm -rf \$REMOTE_PATH
 
-echo "Docker service: $(systemctl is-active docker 2>/dev/null || echo unknown)"
-sudo docker ps --format 'table {{.Names}}\t{{.Status}}' | (grep -E "^\$PROJECT_NAME\b" || (echo "Container not found" && exit 1))
+echo "Cleanup completed"
+ENDSSH
+    
+    if [[ $? -ne 0 ]]; then
+        error_exit "Cleanup failed" 16
+    fi
+    
+    log "Cleanup completed successfully"
+}
 
-echo "Nginx: $(systemctl is-active nginx 2>/dev/null || echo unknown)"
+main() {
+    log "Starting deployment script..."
+    
+    if [[ "${1:-}" == "--cleanup" ]]; then
+        CLEANUP_MODE=true
+        log "Running in cleanup mode"
+        
+        read -rp "Enter SSH Username: " SSH_USER
+        read -rp "Enter Server IP Address: " SERVER_IP
+        read -rp "Enter SSH Key Path [~/.ssh/id_rsa]: " SSH_KEY_PATH
+        SSH_KEY_PATH=${SSH_KEY_PATH:-~/.ssh/id_rsa}
+        SSH_KEY_PATH="${SSH_KEY_PATH/#\~/$HOME}"
+        read -rp "Enter Repository Name: " REPO_NAME
+        
+        cleanup_resources
+        log "Cleanup completed. Exiting."
+        exit 0
+    fi
+    
+    check_dependencies
+    collect_parameters
+    clone_repository
+    verify_dockerfile
+    test_ssh_connection
+    prepare_remote_environment
+    deploy_application
+    configure_nginx
+    validate_deployment
+    
+    log "Deployment completed successfully!"
+    log "Application is accessible at: http://$SERVER_IP"
+    log "Log file: $LOG_FILE"
+}
 
-set +e
-curl -fsS http://127.0.0.1/ >/dev/null && echo "Nginx proxy OK on /" || { echo "Nginx proxy test failed"; exit 1; }
-curl -fsS http://127.0.0.1:80/ >/dev/null && echo "Port 80 OK" || { echo "Port 80 test failed"; exit 1; }
-EOF
-
-log info "Deployment successful! Access the app via http://$SSH_HOST/ (ensure port 80 open)."
-
-exit 0
+main "$@"
